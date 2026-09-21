@@ -1,17 +1,18 @@
 """
-Seletor rápido de opções no dinheiro — ferramenta de decisão, não de histórico.
+Seletor rápido de opções no dinheiro — autossuficiente.
 
-Separado do coletor: não grava acervo, não mescla partição, não depende de
-execução anterior. Entra um ativo, sai uma tabela de calls e puts em torno do
-preço, nos vencimentos mensais do mês corrente e do seguinte.
+Este arquivo não depende do repositório do coletor: traz embutido o cliente
+da brapi e a normalização de que precisa. Assim o repositório "Opcoes-Agora"
+fica independente, e pode virar público mais tarde (para o Streamlit) sem
+carregar dado nem credencial.
 
-IMPORTANTE sobre "valorização no momento": a brapi é EOD. O que aparece é a
-variação do ÚLTIMO PREGÃO FECHADO, não cotação ao vivo. Para decidir entrada
-intradiária, confira o preço na corretora antes de enviar ordem.
+Duas origens de preço, de propósito:
+  - o ATIVO vem do endpoint de cotação, atualizado durante o pregão com
+    alguns minutos de atraso — define a faixa e a distância ao dinheiro;
+  - as OPÇÕES vêm da cadeia, que é do último pregão fechado.
 
 Uso:
-    python selecionar_opcoes.py --underlying PETR4
-    python selecionar_opcoes.py --underlying VALE3 --faixa 0.12 --html saida.html
+    python selecionar_opcoes.py --underlying PETR4 --html saida.html
 """
 
 from __future__ import annotations
@@ -21,22 +22,253 @@ import calendar
 import html as _html
 import logging
 import os
+import time
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-
-from coletor_opcoes import (
-    QUOTE_URL,
-    BrapiClient,
-    BrapiError,
-    _records,
-    enrich,
-    normalize,
-    parse_expirations,
-)
+import requests
 
 log = logging.getLogger("seletor")
+
+BASE = "https://brapi.dev/api/v2/options"
+QUOTE_URL = "https://brapi.dev/api/quote/{ticker}"
+
+COLUMN_ALIASES: dict[str, str] = {
+    "impliedVolatility": "iv",
+    "implied_volatility": "iv",
+    "volatility": "iv",
+    "expirationDate": "expiration",
+    "expiration_date": "expiration",
+    "dueDate": "expiration",
+    "strikePrice": "strike",
+    "openInterest": "open_interest",
+    "open_interest": "open_interest",
+    "coveredPositions": "oi_coberta",
+    "uncoveredPositions": "oi_descoberta",
+    "blockedPositions": "oi_bloqueada",
+    "financialVolume": "financial_volume",
+    "referencePrice": "reference_price",
+    "optionPrice": "option_price",
+    "underlyingPrice": "spot_payload",
+    "impliedVolatility": "iv",
+    "type": "side",
+    "optionType": "side",
+}
+
+NUMERIC = [
+    "strike", "close", "open", "high", "low", "average", "bid", "ask",
+    "volume", "financial_volume", "trades", "open_interest",
+    "oi_coberta", "oi_descoberta", "oi_bloqueada",
+    "iv", "delta", "gamma", "theta", "vega", "rho", "reference_price",
+]
+
+
+class BrapiError(RuntimeError):
+    pass
+
+
+@dataclass
+class BrapiClient:
+    """Cliente com retry exponencial. Sem token, só PETR4 responde (sandbox)."""
+
+    token: str | None = None
+    timeout: int = 30
+    max_retries: int = 4
+    pause: float = 0.35  # respiro entre chamadas
+
+    def __post_init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = "coletor-opcoes/1.0"
+        if self.token:
+            self.session.headers["Authorization"] = f"Bearer {self.token}"
+
+    def _get(self, url: str, **params: Any) -> dict:
+        params = {k: v for k, v in params.items() if v is not None}
+        delay = 1.0
+        last = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                r = self.session.get(url, params=params, timeout=self.timeout)
+                if r.status_code == 200:
+                    time.sleep(self.pause)
+                    return r.json()
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last = f"HTTP {r.status_code}"
+                    log.warning("%s em %s (tentativa %d) — aguardando %.1fs",
+                                last, url, attempt, delay)
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise BrapiError(f"HTTP {r.status_code} em {url}: {r.text[:300]}")
+            except requests.RequestException as exc:
+                last = str(exc)
+                log.warning("Falha de rede (tentativa %d): %s", attempt, exc)
+                time.sleep(delay)
+                delay *= 2
+        raise BrapiError(f"Esgotou {self.max_retries} tentativas em {url}: {last}")
+
+    def expirations(self, underlying: str) -> dict:
+        return self._get(f"{BASE}/expirations", underlying=underlying)
+
+    def chain(self, underlying: str, expiration: str, **kw: Any) -> dict:
+        return self._get(f"{BASE}/chain", underlying=underlying,
+                         expirationDate=expiration, **kw)
+
+    def analytics(self, underlying: str, expiration: str,
+                  on: str | None = None) -> dict:
+        return self._get(f"{BASE}/analytics", underlying=underlying,
+                         expirationDate=expiration, date=on)
+
+    def positions(self, underlying: str, expiration: str,
+                  on: str | None = None) -> dict:
+        return self._get(f"{BASE}/positions", underlying=underlying,
+                         expirationDate=expiration, date=on)
+
+    def spot(self, ticker: str) -> float | None:
+        try:
+            payload = self._get(QUOTE_URL.format(ticker=ticker))
+        except BrapiError as exc:
+            log.warning("Não consegui o spot de %s: %s", ticker, exc)
+            return None
+        for rec in _records(payload):
+            for key in ("regularMarketPrice", "close", "price"):
+                if rec.get(key) is not None:
+                    return float(rec[key])
+        return None
+
+
+def _records(payload: Any) -> list[dict]:
+    """Extrai a lista de registros sem depender do nome da chave de topo."""
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("results", "options", "data", "chain", "analytics",
+                "positions", "expirations", "strikes"):
+        val = payload.get(key)
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            return val
+        # brapi às vezes aninha: results[0].options
+        if isinstance(val, list) and val and isinstance(val[0], dict) is False:
+            continue
+    for val in payload.values():
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            return val
+        if isinstance(val, dict):
+            nested = _records(val)
+            if nested:
+                return nested
+    return []
+
+
+def _scalars(payload: Any) -> list:
+    """Extrai lista de escalares (usado por /expirations, que devolve datas)."""
+    if isinstance(payload, list):
+        return [v for v in payload if not isinstance(v, (dict, list))]
+    if isinstance(payload, dict):
+        for val in payload.values():
+            if isinstance(val, list) and val and not isinstance(val[0], (dict, list)):
+                return val
+            if isinstance(val, (dict, list)):
+                nested = _scalars(val)
+                if nested:
+                    return nested
+    return []
+
+
+def parse_expirations(payload: Any) -> list[str]:
+    dates = _scalars(payload)
+    if dates:
+        return sorted({str(d)[:10] for d in dates})
+    out = set()
+    for rec in _records(payload):
+        for key in ("expirationDate", "expiration", "date", "dueDate"):
+            if rec.get(key):
+                out.add(str(rec[key])[:10])
+    return sorted(out)
+
+
+def normalize(payload: Any, *, underlying: str, expiration: str,
+              trade_date: str) -> pd.DataFrame:
+    recs = _records(payload)
+    if not recs:
+        return pd.DataFrame()
+    df = pd.json_normalize(recs)
+    df = df.rename(columns={k: v for k, v in COLUMN_ALIASES.items() if k in df.columns})
+
+    df["underlying"] = underlying
+    df["expiration"] = df.get("expiration", pd.Series([expiration] * len(df)))
+    df["expiration"] = df["expiration"].astype(str).str[:10]
+    # a coluna "date" do payload é a data do pregão; a de execução não serve
+    if "date" in df.columns:
+        df["trade_date"] = df["date"].astype(str).str[:10]
+    else:
+        df["trade_date"] = trade_date
+
+    for col in NUMERIC:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "side" in df.columns:
+        df["side"] = (df["side"].astype(str).str.lower()
+                      .str.replace("compra", "call", regex=False)
+                      .str.replace("venda", "put", regex=False)
+                      .str[:4])
+    elif "symbol" in df.columns:
+        df["side"] = df["symbol"].map(side_from_symbol)
+
+    return df
+
+
+def side_from_symbol(symbol: str | None) -> str | None:
+    """Padrão B3: letra do mês A-L = call, M-X = put."""
+    if not isinstance(symbol, str) or len(symbol) < 5:
+        return None
+    letter = symbol[4].upper()
+    if "A" <= letter <= "L":
+        return "call"
+    if "M" <= letter <= "X":
+        return "put"
+    return None
+
+
+def enrich(df: pd.DataFrame, spot: float | None) -> pd.DataFrame:
+    """Mid do book, spread relativo e moneyness — a base do filtro de liquidez."""
+    if df.empty:
+        return df
+    out = df.copy()
+    bid = out.get("bid")
+    ask = out.get("ask")
+    if bid is not None and ask is not None:
+        valid = (bid > 0) & (ask > 0) & (ask >= bid)
+        out["mid"] = ((bid + ask) / 2).where(valid)
+        out["spread_pct"] = ((ask - bid) / out["mid"]).where(valid)
+    else:
+        out["mid"] = pd.NA
+        out["spread_pct"] = pd.NA
+
+    # preço utilizável: mid do book, senão fechamento, senão preço de referência
+    out["price"] = out["mid"]
+    for fallback in ("close", "option_price", "reference_price"):
+        if fallback in out.columns:
+            out["price"] = out["price"].fillna(out[fallback])
+
+    if spot:
+        out["spot"] = spot
+        out["moneyness"] = out["strike"] / spot
+    else:
+        out["spot"] = pd.NA
+        out["moneyness"] = pd.NA
+
+    exp = pd.to_datetime(out["expiration"], errors="coerce")
+    td = pd.to_datetime(out["trade_date"], errors="coerce")
+    out["dte"] = (exp - td).dt.days
+    return out
+
+
 
 FAIXA_PADRAO = 0.10       # ±10% em torno do preço do ativo
 

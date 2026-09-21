@@ -290,34 +290,30 @@ def vencimentos_mensais(vencs: list[str], hoje: date, quantos: int = 2) -> list[
     """
     Os próximos vencimentos mensais ainda abertos.
 
-    Não fixa "mês atual e próximo": passado o vencimento de setembro, o mês
-    atual não tem mais série mensal aberta e a tabela viria com uma coluna
-    só. Olhando à frente, sempre saem dois vencimentos úteis.
+    A referência é a terceira sexta de cada mês, mas a busca é tolerante:
+    quando ela cai em feriado a B3 desloca o vencimento para um dia útil
+    próximo. Exigir a data exata pulava o mês inteiro em silêncio — foi o
+    que aconteceu com 20/11/2026, Dia da Consciência Negra. Agora cada mês
+    é resolvido individualmente, aceitando até 4 dias de deslocamento.
     """
-    alvo = []
-    ano, mes = hoje.year, hoje.month
-    for _ in range(quantos + 2):
-        alvo.append(terceira_sexta(ano, mes).isoformat())
-        ano, mes = (ano + 1, 1) if mes == 12 else (ano, mes + 1)
-    alvo = [a for a in alvo if a >= hoje.isoformat()]
-
-    achados = sorted(v for v in vencs if v in alvo)[:quantos]
-    if achados:
-        return achados
-
-    # Feriado pode deslocar o vencimento. Nesse caso, pega o vencimento futuro
-    # mais próximo de cada data-alvo, com tolerância de 4 dias.
-    log.warning("Nenhum vencimento exatamente na 3ª sexta — buscando o mais próximo")
     futuros = sorted(v for v in vencs if v >= hoje.isoformat())
-    saida = []
-    for a in sorted(alvo)[:quantos]:
-        d_alvo = date.fromisoformat(a)
+    saida: list[str] = []
+    ano, mes = hoje.year, hoje.month
+    for _ in range(quantos + 4):
+        alvo = terceira_sexta(ano, mes)
         perto = [v for v in futuros
-                 if abs((date.fromisoformat(v) - d_alvo).days) <= 4]
+                 if abs((date.fromisoformat(v) - alvo).days) <= 4]
         if perto:
-            saida.append(min(perto, key=lambda v: abs((date.fromisoformat(v) - d_alvo).days)))
-    return sorted(set(saida))[:quantos]
-
+            escolhido = min(perto, key=lambda v: abs((date.fromisoformat(v) - alvo).days))
+            if escolhido != alvo.isoformat():
+                log.info("Vencimento de %02d/%d deslocado de %s para %s "
+                         "(provável feriado)", mes, ano, alvo, escolhido)
+            if escolhido not in saida:
+                saida.append(escolhido)
+        if len(saida) == quantos:
+            break
+        ano, mes = (ano + 1, 1) if mes == 12 else (ano, mes + 1)
+    return saida
 
 def spot_da_cotacao(client: BrapiClient, ativo: str) -> tuple[float | None, str]:
     """
@@ -342,10 +338,33 @@ def spot_da_cotacao(client: BrapiClient, ativo: str) -> tuple[float | None, str]
                 break
         if preco is None:
             continue
-        quando = (rec.get("regularMarketTime") or rec.get("updatedAt")
-                  or rec.get("date") or "")
-        return preco, str(quando)[:19].replace("T", " ")
+        bruto = (rec.get("regularMarketTime") or rec.get("updatedAt")
+                 or rec.get("date"))
+        return preco, _hora_brasilia(bruto)
     return None, ""
+
+
+def _hora_brasilia(valor: Any) -> str:
+    """
+    Converte o horário da API para Brasília.
+
+    A brapi informa o horário da cotação em UTC. Exibido cru, 12h15 de
+    Brasília aparecia como 15h15 — três horas à frente, o que faz uma
+    cotação atual parecer futura, ou uma defasada parecer recente.
+    Aceita texto ISO (com ou sem fuso) e epoch em segundos.
+    """
+    if valor is None or valor == "":
+        return ""
+    try:
+        if isinstance(valor, (int, float)):
+            ts = pd.Timestamp(valor, unit="s", tz="UTC")
+        else:
+            ts = pd.Timestamp(str(valor))
+            if ts.tzinfo is None:          # sem fuso explícito: a API usa UTC
+                ts = ts.tz_localize("UTC")
+        return ts.tz_convert("America/Sao_Paulo").strftime("%d/%m/%Y %H:%M:%S")
+    except (ValueError, TypeError):
+        return str(valor)[:19]
 
 
 def variacao(linha: pd.Series) -> float | None:
@@ -383,7 +402,8 @@ def imprimir(tab: pd.DataFrame, spot: float, ativo: str) -> None:
         print("Nenhuma série na faixa.")
         return
     for exp, g in tab.groupby("expiration"):
-        dias = int(g["dte"].iloc[0]) if "dte" in g else 0
+        d = g["dte"].dropna() if "dte" in g else pd.Series(dtype=float)
+        dias = int(d.iloc[0]) if not d.empty else 0
         print(f"\n=== {ativo} · vencimento {str(exp)[:10]} ({dias} dias) · "
               f"spot {spot:.2f} ===")
         for lado in ("call", "put"):
@@ -430,7 +450,8 @@ def gerar_html(tab: pd.DataFrame, spot: float, ativo: str, quando: str,
 
     blocos = []
     for exp, g in tab.groupby("expiration"):
-        dias = int(g["dte"].iloc[0]) if "dte" in g else 0
+        d = g["dte"].dropna() if "dte" in g else pd.Series(dtype=float)
+        dias = int(d.iloc[0]) if not d.empty else 0
         linhas = []
         for lado in ("call", "put"):
             sub = g[g["side"] == lado]
@@ -565,6 +586,10 @@ def main() -> None:
     log.info("Spot %s = %.2f", ativo, spot)
 
     df = enrich(pd.concat(partes, ignore_index=True), spot)
+    # Para decidir entrada, o prazo que importa é de HOJE até o vencimento —
+    # e não depende da data do pregão, cujo formato varia entre endpoints.
+    venc = pd.to_datetime(df["expiration"], errors="coerce", format="mixed")
+    df["dte"] = (venc - pd.Timestamp(hoje)).dt.days
     if args.estilo != "todos" and "optionStyle" in df.columns:
         antes = len(df)
         df = df[df["optionStyle"].astype(str).str.lower() == args.estilo]

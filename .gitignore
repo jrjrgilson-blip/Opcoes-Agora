@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+*.html
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
